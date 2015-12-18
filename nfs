@@ -1,0 +1,253 @@
+--[[
+  CC-NFS: Computer Craft Networked File System
+  description - Authentication-based File Server allowing for
+  storing files across multiple computers from a
+  single computer, securely.
+  author - Maldaris
+  version - v0.5 Beta
+]]
+--[[
+  user table schema
+  {
+    username : String,
+    cryptKey : String,
+  }
+]]
+--[[
+  API = {
+    allPackets : {
+      user : 'string',
+      op : { literal : true, value : 'put' },
+    },
+    put : {
+      input : {
+        overwrite : 'boolean',
+        file : 'string',
+        path : 'string',
+        data : 'string'
+      },
+      returns : {
+        __num : 1,
+        onSuccess : 'boolean',
+        onFailure : 'string'
+      }
+    },
+    get : {
+      input : {
+
+      },
+      returns : {
+        onSuccess : 'string',
+        onFailure : ''
+      }
+    },
+    auth : {
+      doc : "two steps, initiate the authentication, which returns a seed,
+      then using that seed, encrypt a challenge string."
+    },
+  }
+]]
+
+os.loadAPI('./lib/persistence');
+os.loadAPI('./lib/arcfor');
+
+local directoryFormattedPaths = function(parent, children)
+  local ret = {}
+  for k,v in children do
+    if fs.isDir(parent .. k) then
+      ret[k] = v .. '/';
+    end
+  end
+  return ret;
+end
+
+nfs = {
+  timeout = 300, --Reauth Required every 5 Minutes
+  sendAs = os.getComputerID(),
+  registeredUsers = {},
+  userSessions = {},
+}
+
+nfs.__index = nfs;
+
+function nfs:createUserSession(user)
+  if(self.registeredUsers[user] == nil) then
+    return nil
+  end
+  local session = {};
+  session.crypt = {};
+  local key = self.registeredUsers[user].cryptKey;
+  session.crypt.enc = arcfor.new(key);
+  session.crypt.dec = arcfor.new(key);
+  math.randomseed(os.time())
+  session.seed = math.random(0,2048);
+  local padding = 3047;
+  session.crypt.enc.generate(padding + session.seed);
+  session.crypt.dec.generate(padding + session.seed);
+  session.lastRecieved = os.clock();
+  session.seed += padding;
+  return session;
+end -- function
+
+function nfs:auth(user, encoded)
+  local challenge = "Hello World!";
+  if(self.userSessions[user] == nil)
+    self.userSessions[user] = createUserSession(user);
+    return self.userSessions[user].seed;
+  end
+  local msg = self.userSessions.crypto.dec(encoded);
+  if msg == challenge then
+    return true
+  else
+    return false
+  end
+end -- function
+
+function nfs:isAuthenticated(user)
+  if(userSessions and userSessions[user] ~= nil) then
+    local dt = os.clock();
+    if(dt - userSessions[user].lastRecieved  > self.timeout) then
+      return false
+    else
+      return userSessions[user].authenticated
+    end
+  else
+    return false
+  end
+end
+--[[
+
+]]
+function nfs:list(user, path)
+  if(self.isAuthenticated(user)) then
+    --ignore private directories
+    if path.sub(0,0) == '.' then
+      return false, 'invalid directory'
+    end
+    --check if the path exists
+    if fs.exists(path) then
+      local directory = fs.list(path)
+      directory = directoryFormattedPaths(directory);
+      return true, directory;
+    else
+      return false, 'invalid directory';
+    end -- exists
+  else
+    return false, 'Unauthenticated';
+  end -- auth
+end -- list function
+function nfs:get(user, file)
+    if(self.isAuthenticated(user)) then
+      if fs.exists(path .. file) then
+        return true, fs.open(path, 'r').readAll();
+      else
+        return false, 'invalid file path';
+      end
+    else
+      return false, 'Unauthenticated';
+    end
+end -- function
+
+function nfs:put(user, path, file, data, overwrite)
+
+  if(self.isAuthenticated(user)) then
+    if fs.exists(path) == false then
+      fs.makeDir(path)
+    end
+    local flag = '';
+    if overwrite == true then
+      flag = 'w';
+    else
+      flag = 'a';
+    end
+    local file = fs.open(path .. file, flag);
+    file.write(data);
+    file.close();
+    return true, nil;
+  else
+    return false, 'Unauthenticated';
+  end
+end
+
+function nfs:setup(path, hostname)
+  if fs.exists('./.&/users.tbl') then
+    self.registeredUsers = persistence.load('./.&/users.tbl');
+  else
+    return nil;
+  end
+  if( fs.isDir(path) == false ) then
+    return nil;
+  else
+    self.path = path;
+    shell.path(self.path); -- set cwd
+  end
+  --last step, register the hostname
+  self.hostname = hostname;
+  rednet.host('nfs', hostname);
+  self.setup = true;
+  return self;
+end -- setup
+
+function nfs:teardown()
+  rednet.unhost('nfs', self.hostname);
+end --teardown
+
+local function error(id, msg, protocol)
+  local send = {
+    failure : true,
+    errorMessage : msg,
+  };
+  if protocol == nil then
+    rednet.send(id, msg);
+  else
+    rednet.send(id, msg, protocol);
+  end
+end --error
+
+function nfs:run()
+  if(self.setup ~= true) then
+    return nil;
+  else
+    -- begin the event loop
+    while true do
+      id , msg = rednet.receive('nfs');
+      if type(msg) == 'table' then
+        local user = msg.user;
+        local op = msg.op;
+        if op == 'auth' then
+          -- do auth
+          local challenge = msg.challenge;
+          local seed = self.auth(user);
+          rednet.send(id, seed, 'nfs');
+        end;
+        if op == 'list' then
+          -- do list
+          local dir = msg.path;
+          rednet.send(id, self.list(user, path), 'nfs');
+        end;
+        if op == 'get' then
+          -- do get
+          local success, ret = self.get(user, msg.file);
+          if success then
+            rednet.send(id, ret, 'nfs');
+          else
+            rednet.send(id, 'Error:' .. ret, 'nfs');
+          end
+        end;
+        if op == 'put' then
+          -- do put
+            local overwrite = msg.overwrite;
+            local path = msg.path;
+            local file = msg.file;
+            local data = msg.data;
+            local success, res = self.put(user, path, file, data, overwrite);
+            if success then
+              rednet.send(id, true, 'nfs');
+            else
+              error(id, res, 'nfs');
+            end;
+        end; -- put
+      end; -- typeof
+    end; --while
+  end; -- setup
+end; -- run
